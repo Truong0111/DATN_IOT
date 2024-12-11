@@ -2,15 +2,130 @@
 
 #include <TruongTq.h>
 #include <MyUtil.h>
-#include <MyWifiSetup.h>
-#include <MyMqtt.h>
-
-#include <WiFi.h>
 #include <lvgl.h>
 #include <TFT_eSPI.h>
 
 #include <Preferences.h>
 Preferences preferences;
+
+#include <WiFi.h>
+#include <BluetoothSerial.h>
+BluetoothSerial SerialBT;
+
+#include <PubSubClient.h>
+WiFiClient espClient;
+PubSubClient client(espClient);
+IPAddress ip;
+
+void receive_bluetooth_data() {
+  if (SerialBT.available()) {
+    char received[100];
+    int index = 0;
+
+    while (SerialBT.available()) {
+      char byteReceived = SerialBT.read();
+      if (byteReceived == '\n' || index >= sizeof(received) - 1) {
+        break;
+      }
+      received[index++] = byteReceived;
+    }
+
+    received[index] = '\0';
+
+    Serial.println("Received: ");
+    Serial.println(received);
+
+    String data = String(received);
+
+    int firstDelimiter = data.indexOf('|');
+    int secondDelimiter = data.indexOf('|', firstDelimiter + 1);
+
+    if (firstDelimiter == -1) {
+      Serial.println("Error: Invalid format.");
+      return;
+    }
+
+    String type = data.substring(0, firstDelimiter);
+
+    if (type == "WIFI") {
+      String ssid = data.substring(firstDelimiter + 1, secondDelimiter);
+      String password = data.substring(secondDelimiter + 1);
+
+      if (ssid.length() > 0 && password.length() > 0) {
+        preferences.putString(PREF_SSID, ssid);
+        preferences.putString(PREF_SSID_PWD, password);
+
+        WiFi.begin(ssid.c_str(), password.c_str());
+      } else {
+        Serial.println("Error: Invalid WIFI format.");
+      }
+    } else if (type == "MQTT") {
+      String serverIP = data.substring(firstDelimiter + 1);
+
+      if (serverIP.length() > 0) {
+        if (ip.fromString(serverIP)) {
+          client.disconnect();
+          client.setServer(ip, MQTT_PORT);
+          preferences.putString(PREF_IP_MQTT, serverIP);
+        }
+      } else {
+        Serial.println("Error: Invalid MQTT format.");
+      }
+    } else {
+      Serial.printf("Unknown type: %s\n", type.c_str());
+    }
+  } else {
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup_wifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  String saveSSID = preferences.getString(PREF_SSID, "");
+  String saveSSIDPassword = preferences.getString(PREF_SSID_PWD, "");
+
+  Serial.println(saveSSID + " " + saveSSID.length());
+  Serial.println(saveSSIDPassword + " " + saveSSIDPassword.length());
+
+  // Add list of WiFi networks
+  if (!saveSSID.isEmpty() && !saveSSIDPassword.isEmpty()) {
+    WiFi.begin(saveSSID.c_str(), saveSSIDPassword.c_str());
+  } else {
+    WiFi.begin("TTL", "truongtq204859");
+  }
+}
+
+void reconnect_mqtt() {
+  if (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("Esp32", MQTT_USERNAME, MQTT_PASSWORD)) {
+      Serial.println("MQTT client connected");
+      client.subscribe(MQTT_TOPIC);
+      Serial.println("Subscribed to: " + String(MQTT_TOPIC));
+    } else {
+      Serial.printf("Failed, rc=%d. Trying again in 5 seconds.\n", client.state());
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+void send_message_mqtt(String msg) {
+  Serial.println("Send message: " + msg);
+  client.publish(MQTT_TOPIC, msg.c_str());
+}
+
+void setup_mqtt() {
+  String mqtt_server = preferences.getString(PREF_IP_MQTT, "");
+  if (mqtt_server.isEmpty()) {
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+  } else if (ip.fromString(mqtt_server)) {
+    client.setServer(ip, MQTT_PORT);
+  }
+
+  client.setCallback(callback);
+}
 
 // UI objects
 lv_obj_t *qrUser = nullptr;
@@ -55,7 +170,7 @@ void save_id_door(String macAddress, String idDoor) {
 // LVGL
 #include <XPT2046_Touchscreen.h>
 
-#define DRAW_BUF_SIZE (LV_HOR_RES * LV_VER_RES / 10 * (LV_COLOR_DEPTH / 8))
+#define DRAW_BUF_SIZE (LV_HOR_RES * LV_VER_RES / 20 * (LV_COLOR_DEPTH / 8))
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
 int x, y, z;
@@ -148,8 +263,6 @@ void update_qr_user(String macAddress, String idDoor, String token) {
 }
 
 void update_qr_manager() {
-  if (!is_wifi_connect()) return;
-
   String current_mac = WiFi.macAddress();
   if (my_mac_address != current_mac) {
     my_mac_address = current_mac;
@@ -172,12 +285,11 @@ void access_door(String macAddress, String idDoor) {
   String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
   if (myIdDoor != idDoor) return;
   ledcWrite(LED_GREEN_PIN, 0);
-  delay(10000);
+  vTaskDelay(10000 / portTICK_PERIOD_MS);
   ledcWrite(LED_GREEN_PIN, 255);
 }
 
 void check_token() {
-  if (!is_wifi_connect()) return;
   if (!client.connected()) return;
   if (is_update_qr_user) return;
   String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
@@ -185,6 +297,7 @@ void check_token() {
   String requestQrUserMsg = String(FROM_ESP) + "::" + String(CHECK_TOKEN) + "::" + my_mac_address + "::" + myIdDoor;
   send_message_mqtt(requestQrUserMsg);
   is_update_qr_user = true;
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
 }
 
 void get_response_check_token(String macAddress, String idDoor, String response) {
@@ -201,6 +314,11 @@ void get_response_check_token(String macAddress, String idDoor, String response)
 void setup() {
   Serial.begin(115200);
 
+  preferences.begin("my-esp", false);
+
+  SerialBT.begin("ESP32_LVGL");
+  delay(20);
+
   // Led init
   pinMode(LED_GREEN_PIN, OUTPUT);
   ledcAttach(LED_GREEN_PIN, 5000, 8);
@@ -210,29 +328,28 @@ void setup() {
   setup_wifi();
   delay(20);
   // MQTT init
-  setup_mqtt(callback);
+  setup_mqtt();
   delay(20);
   // LVGL init
   setup_lvgl();
   delay(20);
-
-  preferences.begin("my-esp", false);
 }
 
 void main_loop() {
-  if (!is_wifi_connect()) {
-    Serial.println("WiFi disconnected. Reconnecting...");
-    wifiMulti.run();
+  if (SerialBT.isReady()) {
+    receive_bluetooth_data();
   }
 
+  if (WiFi.status() != WL_CONNECTED) return;
+
   if (!client.connected()) {
-    reconnect();
+    reconnect_mqtt();
   }
   client.loop();
 
   update_qr_manager();
-  if (!my_token.isEmpty()) return;
-  check_token();
+  if (my_token.isEmpty())
+    check_token();
 }
 
 void loop() {

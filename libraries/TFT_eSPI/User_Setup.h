@@ -36,7 +36,7 @@
 //#define RPI_DISPLAY_TYPE // 20MHz maximum SPI
 
 // Only define one driver, the other ones must be commented out
-//#define ILI9341_DRIVER       // Generic driver for common displays
+// #define ILI9341_DRIVER       // Generic driver for common displays
 //#define ILI9341_2_DRIVER     // Alternative ILI9341 driver, see https://github.com/Bodmer/TFT_eSPI/issues/1172
 //#define ST7735_DRIVER      // Define additional parameters below for this display
 //#define ILI9163_DRIVER     // Define additional parameters below for this display
@@ -340,7 +340,7 @@
 // The ESP32 has 2 free SPI ports i.e. VSPI and HSPI, the VSPI is the default.
 // If the VSPI port is in use and pins are not accessible (e.g. TTGO T-Beam)
 // then uncomment the following line:
-//#define USE_HSPI_PORT
+#define USE_HSPI_PORT
 
 // Comment out the following #define if "SPI Transactions" do not need to be
 // supported. When commented out the code size will be smaller and sketches will

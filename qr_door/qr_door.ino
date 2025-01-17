@@ -1,46 +1,72 @@
 #include <Arduino.h>
-#include <TruongTq.h>
-#include <MyUtil.h>
+#include <truong_tq.h>
 #include <lvgl.h>
-#include <TFT_eSPI.h>
-#include <string>
-#include <sstream>
-#include <iomanip>
-
+#include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
-Preferences preferences;
-
 #include <WiFi.h>
 #include <BluetoothSerial.h>
-BluetoothSerial SerialBT;
-
 #include <PubSubClient.h>
-WiFiClient espClient;
-PubSubClient client(espClient);
-IPAddress ip;
-
-#include <SPIFFS.h>
 #include <rdm6300.h>
 #include <MFRC522.h>
 #include <SPI.h>
 
-#define RDM6300_RX_PIN 22
-#define RST_PIN -1  // Chân RST
-#define SS_PIN 5    // Chân SDA/SS
-#define UID_FILE "/uid_list.txt"
+// Define for lvgl
+#define DRAW_BUF_SIZE (LV_HOR_RES * LV_VER_RES / 20 * (LV_COLOR_DEPTH / 8))
+uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
-#define RFID_MOSI 18  //MOSI
-#define RFID_MISO 19  //MISO
-#define RFID_SCK 23   //SCK
-#define RFID_SDA 5    //SS
-
-MFRC522 rfid(SS_PIN, RST_PIN);
+Preferences preferences;
+BluetoothSerial SerialBT;
+WiFiClient espClient;
+PubSubClient client(espClient);
+IPAddress ip;
 Rdm6300 rdm6300;
+MFRC522 rfid(SS_PIN, RST_PIN);
+SPIClass touchscreenSPI = SPIClass(HSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+
+// ### Kết nối RDM6300
+// | Chân RDM6300 | Chân ESP32 |
+// |--------------|------------|
+// | TX           | GPIO35     |
+// | 0V           | GND        |
+// | 5V           | 5V         |
+
+// ### Kết nối Relay
+// | Chân Relay   | Chân ESP32 |
+// |--------------|------------|
+// | GND          | GND        |
+// | 5V           | 5V         |
+// | IN           | GPIO21     |
+
+// ### Kết nối RC522
+// | Chân RC522   | Chân ESP32 |
+// |--------------|------------|
+// | MOSI         | GPIO23     |
+// | MISO         | GPIO19     |
+// | SCK          | GPIO18     |
+// | SS/SDA       | GPIO5      |
+// | GND          | GND        |
+// | RST          | 3.3V       |
+// | 3.3V         | 3.3V       |
+
+// ### Kết nối Còi
+// | Chân còi     | Chân ESP32 |
+// |--------------|------------|
+// | +            | GPIO22     |
+// | GND          | GND        |
+
+// ### Các kết nối khác
+// | Mô-đun      | Chân ESP32 |
+// |-------------|------------|
+// | LED Green   | GPIO17     |
+// | LED Blue    | GPIO16     |
+
 
 // UI objects
 lv_obj_t *qrUser = nullptr;
 lv_obj_t *qrManager = nullptr;
 lv_obj_t *rfidLabel = nullptr;
+lv_obj_t *registerCardTxt = nullptr;
 
 // Global variables
 String my_mac_address = "";
@@ -48,257 +74,248 @@ String my_token = "";
 bool is_update_mac = false;
 bool is_update_qr_user = false;
 bool is_registering_card = false;
+bool is_remove_card = false;
+bool is_accept = false;
+bool is_deny = false;
+bool is_reading_card = false;
 
-// RFID
-void setup_rfid() {
-  rdm6300.begin(RDM6300_RX_PIN);
-
-  SPI.begin(RFID_MOSI, RFID_MISO, RFID_SCK, RFID_SDA);
-  rfid.PCD_Init();
-
-  if (!SPIFFS.begin(true)) {
-    Serial.println("Can't init SPIFFS.");
-    return;
+//---------- RFID Functions ----------
+void notify_rfid_to_mqtt(const char *action, const char *uid) {
+  if (WiFi.status() == WL_CONNECTED) {
+    String msg = String(FROM_ESP) + "::" + String(RFID) + "::" + String(action) + "::" + my_mac_address + "::" + String(uid);
+    send_message_mqtt(msg);
   }
-  Serial.println("SPIFFS ready.");
 }
 
-void rfid_rdm_loop() {
-  if (rdm6300.get_new_tag_id()) {
-    uint32_t uid_scan = rdm6300.get_tag_id();
+void notify_access_door_to_mqtt(const char *type, bool isAccess, const char *uid, const char *status = "") {
+  if (WiFi.status() == WL_CONNECTED) {
+    String msg = String(FROM_ESP) + "::" + String(ACCESS_DOOR) + "::" + String(type) + "::" + String(isAccess) + "::" + String(uid) + "::" + String(status);
+    send_message_mqtt(msg);
+  }
+}
+
+void handle_rfid(const char *uid_str) {
+  Serial.println(uid_str);
+  is_reading_card = true;
+
+  if (is_registering_card || is_remove_card) {
+    bool isRegistered = verify_id_card(uid_str);
+
     if (is_registering_card) {
-      char uid_str[4 * sizeof(uid_scan)];
-      snprintf(uid_str, sizeof(str), "%u", number);
-      if (verify_id_card(uid_str)) {
+      if (isRegistered) {
         Serial.println("Card is already registered.");
+        is_deny = true;
       } else {
         save_id_card(uid_str);
-        is_registering_card = false;
+        is_accept = true;
+        Serial.println("Card registered successfully.");
+        notify_rfid_to_mqtt("REGISTER", uid_str);
       }
-    } else {
-      char uid_str[4 * sizeof(uid_scan)];
-      snprintf(uid_str, sizeof(str), "%u", number);
-      if (verify_id_card(uid_str)) {
-        open_door();
-        vTaskDelay(1500);
+      is_registering_card = false;
+    } else if (is_remove_card) {
+      if (isRegistered) {
+        remove_id_card(uid_str);
+        is_accept = true;
+        Serial.println("Card removed successfully.");
+        notify_rfid_to_mqtt("REMOVE", uid_str);
       } else {
         Serial.println("Card is not registered.");
+        is_deny = true;
       }
+      is_remove_card = false;
     }
-  }
-}
 
-template<typename TInputIter>
-std::string make_hex_string(TInputIter first, TInputIter last, bool use_uppercase = true, bool insert_spaces = false) {
-  std::ostringstream ss;
-  ss << std::hex << std::setfill('0');
-  if (use_uppercase)
-    ss << std::uppercase;
-  while (first != last) {
-    ss << std::setw(2) << static_cast<int>(*first++);
-    if (insert_spaces && first != last)
-      ss << " ";
-  }
-  return ss.str();
-}
-
-void rfid_rc_loop() {
-  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
-    return;
-  }
-
-  std::vector<uint8_t> uid_vector(rfid.uid.uidByte, rfid.uid.uidByte + rfid.uid.size);
-  auto uid_str = make_hex_string(uid_vector.begin(), uid_vector.end(), true, false);
-
-  if (is_registering_card) {
-    if (verify_id_card(String(uid_hex.c_str()))) {
-      Serial.println("Card is already registered.");
-    } else {
-      save_id_card(String(uid_hex.c_str()));
-      is_registering_card = false;
-    }
+    digitalWrite(LED_BLUE_PIN, HIGH);
+    hide_register_card_text();
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
   } else {
-    if (verify_id_card(String(uid_hex.c_str()))) {
+    if (verify_id_card(uid_str)) {
+      Serial.println("Open door by card.");
       open_door();
-      vTaskDelay(1500);
+      String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
+      if (myIdDoor.isEmpty()) {
+        notify_access_door_to_mqtt("RFID", true, uid_str, "No_id_door");
+      } else {
+        notify_access_door_to_mqtt("RFID", true, uid_str, myIdDoor.c_str());
+      }
     } else {
       Serial.println("Card is not registered.");
+      is_deny = true;
+      notify_access_door_to_mqtt("RFID", false, uid_str, "Card_is_not_registered");
     }
   }
-
-  rfid.PICC_HaltA();
 }
 
-void save_id_card(String uid) {
-  File file = SPIFFS.open(UID_FILE, FILE_APPEND);
-  if (!file) {
-    Serial.println("Can't open file to write uid.");
+void scan_rfid() {
+  if (is_reading_card) return;
+
+  char uid_str[9];
+  if (rdm6300.get_new_tag_id()) {
+    snprintf(uid_str, sizeof(uid_str), "%08X", rdm6300.get_tag_id());
+    handle_rfid(uid_str);
     return;
   }
 
-  file.println(uid);
-  file.close();
-  Serial.print("Đã lưu UID: ");
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    for (size_t i = 0; i < rfid.uid.size; i++) {
+      snprintf(uid_str + i * 2, 3, "%02X", rfid.uid.uidByte[i]);
+    }
+
+    handle_rfid(uid_str);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+}
+
+void save_id_card(const char *uid) {
+  preferences.putString(uid, String(ACCEPT));
+  indicate_action("Save UID: ", uid);
+}
+
+void remove_id_card(const char *uid) {
+  preferences.putString(uid, String(REJECT));
+  indicate_action("Remove UID: ", uid);
+}
+
+bool verify_id_card(const char *uid) {
+  return preferences.getString(uid, String(REJECT)) == String(ACCEPT);
+}
+
+void indicate_action(const char *action, const char *uid) {
+  Serial.print(action);
   Serial.println(uid);
+  digitalWrite(LED_GREEN_PIN, LOW);
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  digitalWrite(LED_GREEN_PIN, HIGH);
 }
 
-bool verify_id_card(String uid) {
-  std::vector<String> uidList = read_id_cards();
+//----------------------------------
 
-  for (String savedUID : uidList) {
-    if (savedUID == uid) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::vector<String> read_id_cards() {
-  std::vector<String> uidList;
-
-  File file = SPIFFS.open(UID_FILE, FILE_READ);
-  if (!file) {
-    Serial.println("Can't open file to write uid.");
-    return uidList;
-  }
-  while (file.available()) {
-    String uid = file.readStringUntil('\n');
-    uid.trim();
-    if (uid.length() > 0) {
-      uidList.push_back(uid);
-    }
-  }
-
-  file.close();
-  return uidList;
-}
-
-// Receive bluetooth data from mobile
+//---------- Bluetooth Functions ----------
+//  Receive bluetooth data from mobile
 void receive_bluetooth_data() {
-  if (SerialBT.available()) {
-    char received[100];
-    int index = 0;
-
-    while (SerialBT.available()) {
-      char byteReceived = SerialBT.read();
-      if (byteReceived == '\n' || index >= sizeof(received) - 1) {
-        break;
-      }
-      received[index++] = byteReceived;
-    }
-
-    received[index] = '\0';
-
-    Serial.println("Received: ");
-    Serial.println(received);
-
-    String data = String(received);
-
-    int firstDelimiter = data.indexOf('|');
-    int secondDelimiter = data.indexOf('|', firstDelimiter + 1);
-
-    if (firstDelimiter == -1) {
-      Serial.println("Error: Invalid format.");
-      return;
-    }
-
-    String type = data.substring(0, firstDelimiter);
-
-    if (type == "WIFI") {
-      String ssid = data.substring(firstDelimiter + 1, secondDelimiter);
-      String password = data.substring(secondDelimiter + 1);
-
-      if (ssid.length() > 0) {
-        preferences.putString(PREF_SSID, ssid);
-        preferences.putString(PREF_SSID_PWD, password);
-
-        if (password.length() == 0) {
-          password = "";
-        }
-
-        WiFi.begin(ssid.c_str(), password.c_str());
-      } else {
-        Serial.println("Error: Invalid WIFI format.");
-      }
-    } else if (type == "MQTT") {
-      String serverIP = data.substring(firstDelimiter + 1);
-
-      if (serverIP.length() > 0) {
-        if (ip.fromString(serverIP)) {
-          client.disconnect();
-          client.setServer(ip, MQTT_PORT);
-          preferences.putString(PREF_IP_MQTT, serverIP);
-        }
-      } else {
-        Serial.println("Error: Invalid MQTT format.");
-      }
-    } else if (type == "RFID") {
-      String action = data.substring(firstDelimiter + 1, secondDelimiter);
-      if (action.length() > 0) {
-        if (action == "REGISTER") {
-          is_registering_card = true;
-        } else if (action == "REMOVE") {
-          String cardUID = data.substring(secondDelimiter + 1);
-        }
-      }
-    } else {
-      Serial.printf("Unknown type: %s\n", type.c_str());
-    }
-  } else {
+  if (!SerialBT.available()) {
     vTaskDelay(10 / portTICK_PERIOD_MS);
+    return;
   }
-}
 
-// Setup wifi
-void setup_wifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  char received[100];
+  int index = 0;
 
-  String saveSSID = preferences.getString(PREF_SSID, "");
-  String saveSSIDPassword = preferences.getString(PREF_SSID_PWD, "");
+  while (SerialBT.available()) {
+    char byteReceived = SerialBT.read();
+    if (byteReceived == '\n' || index >= sizeof(received) - 1) {
+      break;
+    }
+    received[index++] = byteReceived;
+  }
 
-  // Add list of WiFi networks
-  if (!saveSSID.isEmpty() && !saveSSIDPassword.isEmpty()) {
-    WiFi.begin(saveSSID.c_str(), saveSSIDPassword.c_str());
+  received[index] = '\0';
+
+  Serial.println("Received: ");
+  Serial.println(received);
+
+  String data = String(received);
+
+  int firstDelimiter = data.indexOf('|');
+  int secondDelimiter = data.indexOf('|', firstDelimiter + 1);
+
+  if (firstDelimiter == -1) {
+    Serial.println("Error: Invalid format.");
+    return;
+  }
+
+  String type = data.substring(0, firstDelimiter);
+  String param1 = data.substring(firstDelimiter + 1, secondDelimiter);
+  String param2 = data.substring(secondDelimiter + 1);
+
+  if (type == "WIFI") {
+    handle_wifi_config(param1, param2);
+  } else if (type == "MQTT") {
+    handle_mqtt_config(param1);
+  } else if (type == "RFID") {
+    handle_rfid_action(param1);
   } else {
-    WiFi.begin("TTL", "truongtq204859");
+    Serial.printf("Unknown type: %s\n", type.c_str());
   }
 }
 
-// Setup mqtt
-void setup_mqtt() {
-  String mqtt_server = preferences.getString(PREF_IP_MQTT, "");
-  if (mqtt_server.isEmpty()) {
-    client.setServer(MQTT_SERVER, MQTT_PORT);
-  } else if (ip.fromString(mqtt_server)) {
-    client.setServer(ip, MQTT_PORT);
+void handle_wifi_config(const String &ssid, const String &password) {
+  if (ssid.isEmpty()) {
+    Serial.println("Error: Invalid WIFI format.");
+    return;
   }
 
-  client.setCallback(callback);
+  preferences.putString(PREF_SSID, ssid);
+  preferences.putString(PREF_SSID_PWD, password);
+
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid.c_str(), password.isEmpty() ? nullptr : password.c_str());
 }
 
-// Reconnect mqtt
+void handle_mqtt_config(const String &serverIP) {
+  if (serverIP.isEmpty() || !ip.fromString(serverIP)) {
+    Serial.println("Error: Invalid MQTT format.");
+    return;
+  }
+
+  client.disconnect();
+  client.setServer(ip, MQTT_PORT);
+  preferences.putString(PREF_IP_MQTT, serverIP);
+  Serial.println("MQTT server updated.");
+}
+
+void handle_rfid_action(const String &action) {
+  if (action == "REGISTER") {
+    is_registering_card = true;
+    digitalWrite(LED_BLUE_PIN, LOW);
+    show_register_card_text(true);
+  } else if (action == "REMOVE") {
+    is_remove_card = true;
+    show_register_card_text(false);
+  } else if (action == "CANCEL") {
+    is_registering_card = false;
+    is_remove_card = false;
+    digitalWrite(LED_BLUE_PIN, HIGH);
+    hide_register_card_text();
+  } else {
+    Serial.printf("Unknown RFID action: %s\n", action.c_str());
+  }
+}
+
+void handle_wifi_reconnect() {
+  static unsigned long lastReconnectAttempt = 0;
+  unsigned long now = millis();
+
+  if (now - lastReconnectAttempt > WIFI_RECONNECT_TIME) {
+    lastReconnectAttempt = now;
+    Serial.println("Reconnecting to WiFi...");
+    WiFi.reconnect();
+  }
+}
+
+//----------------------------------
+
+//---------- MQTT Functions ----------
 void reconnect_mqtt() {
   if (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     if (client.connect("Esp32", MQTT_USERNAME, MQTT_PASSWORD)) {
       Serial.println("MQTT client connected");
+      client.setKeepAlive(30);
       client.subscribe(MQTT_TOPIC);
       Serial.println("Subscribed to: " + String(MQTT_TOPIC));
     } else {
       Serial.printf("Failed, rc=%d. Trying again in 5 seconds.\n", client.state());
-      vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
   }
 }
 
-// Send message to mqtt
 void send_message_mqtt(String msg) {
   Serial.println("Send message: " + msg);
   client.publish(MQTT_TOPIC, msg.c_str());
 }
 
-// Get callback from mqtt
 void callback(char *topic, byte *payload, unsigned int length) {
   String message = "";
   for (unsigned int i = 0; i < length; i++) {
@@ -327,22 +344,15 @@ void callback(char *topic, byte *payload, unsigned int length) {
   }
 }
 
+//----------------------------------
 void save_id_door(String macAddress, String idDoor) {
   if (my_mac_address != macAddress)
     return;
   preferences.putString(PREF_ID_DOOR, idDoor);
 }
 
-// LVGL
-#include <XPT2046_Touchscreen.h>
-
-#define DRAW_BUF_SIZE (LV_HOR_RES * LV_VER_RES / 20 * (LV_COLOR_DEPTH / 8))
-uint32_t draw_buf[DRAW_BUF_SIZE / 4];
-
+//---------- LVGL Functions ----------
 int x, y, z;
-SPIClass touchscreenSPI = SPIClass(VSPI);
-XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
-
 void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
   if (touchscreen.tirqTouched() && touchscreen.touched()) {
     TS_Point p = touchscreen.getPoint();
@@ -364,10 +374,217 @@ void log_print(lv_log_level_t level, const char *buf) {
   Serial.flush();
 }
 
+void show_register_card_text(bool is_register) {
+  const char *text = is_register
+                       ? "Register RFID: Waiting for card ..."
+                       : "Remove RFID: Waiting for card ...";
+
+  lv_label_set_text(registerCardTxt, text);
+  lv_obj_clear_flag(registerCardTxt, LV_OBJ_FLAG_HIDDEN);
+}
+
+void hide_register_card_text() {
+  lv_obj_add_flag(registerCardTxt, LV_OBJ_FLAG_HIDDEN);
+}
+
+void lv_create_tab_gui(void) {
+  lv_obj_t *tabview = lv_tabview_create(lv_scr_act());
+  lv_tabview_set_tab_bar_position(tabview, LV_DIR_LEFT);
+
+  lv_obj_t *tabUser = lv_tabview_add_tab(tabview, "User");
+  lv_obj_t *tabManager = lv_tabview_add_tab(tabview, "Manager");
+
+  lv_color_t bg_color = lv_palette_lighten(LV_PALETTE_LIGHT_BLUE, 5);
+  lv_color_t fg_color = lv_palette_darken(LV_PALETTE_BLUE, 4);
+
+  qrUser = create_qrcode(tabUser, fg_color, bg_color);
+  qrManager = create_qrcode(tabManager, fg_color, bg_color);
+
+  registerCardTxt = lv_label_create(lv_screen_active());
+  lv_obj_set_style_bg_color(registerCardTxt, bg_color, 0);
+  lv_obj_set_size(registerCardTxt, 300, 80);
+  lv_obj_set_style_text_align(registerCardTxt, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(registerCardTxt, LV_ALIGN_TOP_MID, 0, 0);
+  hide_register_card_text();
+}
+
+lv_obj_t *create_qrcode(lv_obj_t *parent, lv_color_t fg_color, lv_color_t bg_color) {
+  lv_obj_t *qrcode = lv_qrcode_create(parent);
+  lv_qrcode_set_size(qrcode, 200);
+  lv_qrcode_set_dark_color(qrcode, fg_color);
+  lv_qrcode_set_light_color(qrcode, bg_color);
+  lv_obj_center(qrcode);
+
+  lv_obj_set_style_border_color(qrcode, bg_color, 0);
+  lv_obj_set_style_border_width(qrcode, 5, 0);
+
+  return qrcode;
+}
+
+void update_qr_user(const String &macAddress, const String &idDoor, const String &token) {
+  if (my_mac_address != macAddress || preferences.getString(PREF_ID_DOOR, "") != idDoor)
+    return;
+
+  my_token = idDoor + "::" + token;
+  lv_qrcode_update(qrUser, my_token.c_str(), my_token.length());
+  is_update_qr_user = true;
+}
+
+void update_qr_manager() {
+  String current_mac = WiFi.macAddress();
+  if (my_mac_address != current_mac) {
+    my_mac_address = current_mac;
+    lv_qrcode_update(qrManager, current_mac.c_str(), current_mac.length());
+    is_update_mac = false;
+  }
+
+  if (is_update_mac || !client.connected())
+    return;
+
+  String door_id = preferences.getString(PREF_ID_DOOR, "");
+  if (door_id.isEmpty())
+    return;
+
+  String sendMsg = String(FROM_ESP) + "::" + String(UPDATE_MAC) + "::" + my_mac_address + "::" + door_id;
+  send_message_mqtt(sendMsg);
+  is_update_mac = true;
+}
+
+//---------- Another Functions ----------
+
+void access_door(String macAddress, String idDoor) {
+  if (my_mac_address != macAddress)
+    return;
+  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
+  if (myIdDoor != idDoor)
+    return;
+  open_door();
+}
+
+void open_door() {
+  is_accept = true;
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH);
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
+  digitalWrite(LED_GREEN_PIN, HIGH);
+  digitalWrite(RELAY_PIN, LOW);
+}
+
+void check_token() {
+  if (!client.connected() || is_update_qr_user)
+    return;
+
+  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
+  if (myIdDoor.isEmpty()) {
+    send_message_mqtt(String(FROM_ESP) + "::" + String(REQUEST_ID_DOOR) + "::" + my_mac_address);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    return;
+  }
+
+  send_message_mqtt(String(FROM_ESP) + "::" + String(CHECK_TOKEN) + "::" + my_mac_address + "::" + myIdDoor);
+
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
+}
+
+void get_response_check_token(String macAddress, String idDoor, String response) {
+  if (my_mac_address != macAddress)
+    return;
+  if (preferences.getString(PREF_ID_DOOR, "") != idDoor)
+    return;
+
+  if (response == "TokenInvalid") {
+    is_update_qr_user = false;
+  } else {
+    update_qr_user(macAddress, idDoor, response);
+  }
+}
+
+//----------------------------------
+
+//---------- Task ----------
+
+void mqtt_task(void *pvParameters) {
+  while (true) {
+    if (WiFi.status() != WL_CONNECTED) {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
+    }
+    if (!client.connected()) {
+      reconnect_mqtt();
+    }
+    client.loop();
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+void whistle_task(void *pvParameters) {
+  while (true) {
+    if (is_accept) {
+      digitalWrite(WHISTLE_PIN, HIGH);
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      digitalWrite(WHISTLE_PIN, LOW);
+      vTaskDelay(150 / portTICK_PERIOD_MS);
+
+      digitalWrite(WHISTLE_PIN, HIGH);
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      digitalWrite(WHISTLE_PIN, LOW);
+
+      is_accept = false;
+      is_reading_card = false;
+    } else if (is_deny) {
+      digitalWrite(WHISTLE_PIN, HIGH);
+      vTaskDelay(800 / portTICK_PERIOD_MS);
+      digitalWrite(WHISTLE_PIN, LOW);
+
+      is_deny = false;
+      is_reading_card = false;
+    } else {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+//----------------------------------
+
+//---------- Setup ----------
+void setup_rfid() {
+  rdm6300.begin(RDM6300_RX_PIN);
+
+  SPI.begin();
+  rfid.PCD_Init();
+}
+
+void setup_wifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  String saveSSID = preferences.getString(PREF_SSID, "");
+  String saveSSIDPassword = preferences.getString(PREF_SSID_PWD, "");
+
+  // Add list of WiFi networks
+  if (!saveSSID.isEmpty() && !saveSSIDPassword.isEmpty()) {
+    WiFi.begin(saveSSID.c_str(), saveSSIDPassword.c_str());
+  } else {
+    WiFi.begin("TTL", "truongtq204859");
+  }
+}
+
+void setup_mqtt() {
+  String mqtt_server = preferences.getString(PREF_IP_MQTT, "");
+  if (mqtt_server.isEmpty()) {
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+  } else if (ip.fromString(mqtt_server)) {
+    client.setServer(ip, MQTT_PORT);
+  }
+
+  client.setCallback(callback);
+}
+
 void setup_lvgl() {
   lv_init();
   lv_log_register_print_cb(log_print);
 
+  // init SPI for lvgl
   touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   touchscreen.begin(touchscreenSPI);
   touchscreen.setRotation(0);
@@ -383,164 +600,50 @@ void setup_lvgl() {
   lv_create_tab_gui();
 }
 
-void lv_create_tab_gui(void) {
-  lv_obj_t *label;
-
-  lv_obj_t *tabview = lv_tabview_create(lv_scr_act());
-  lv_tabview_set_tab_bar_position(tabview, LV_DIR_LEFT);
-
-  lv_obj_t *tabUser = lv_tabview_add_tab(tabview, "User");
-  lv_obj_t *tabManager = lv_tabview_add_tab(tabview, "Manager");
-  lv_obj_t *tabRfid = lv_tabview_add_tab(tabview, "RFID");
-
-  lv_color_t bg_color = lv_palette_lighten(LV_PALETTE_LIGHT_BLUE, 5);
-  lv_color_t fg_color = lv_palette_darken(LV_PALETTE_BLUE, 4);
-
-  qrUser = lv_qrcode_create(tabUser);
-  lv_qrcode_set_size(qrUser, 200);
-  lv_qrcode_set_dark_color(qrUser, fg_color);
-  lv_qrcode_set_light_color(qrUser, bg_color);
-  lv_obj_center(qrUser);
-
-  lv_obj_set_style_border_color(qrUser, bg_color, 0);
-  lv_obj_set_style_border_width(qrUser, 5, 0);
-
-  qrManager = lv_qrcode_create(tabManager);
-  lv_qrcode_set_size(qrManager, 200);
-  lv_qrcode_set_dark_color(qrManager, fg_color);
-  lv_qrcode_set_light_color(qrManager, bg_color);
-  lv_obj_center(qrManager);
-
-  lv_obj_set_style_border_color(qrManager, bg_color, 0);
-  lv_obj_set_style_border_width(qrManager, 5, 0);
-
-  lv_obj_t *registerCardBtn = lv_button_create(tabRfid);
-  lv_obj_add_event_cb(registerCardBtn, register_event_handler, LV_EVENT_ALL, NULL);
-  lv_obj_align(registerCardBtn, LV_ALIGN_CENTER, 0, -40);
-  lv_obj_remove_flag(registerCardBtn, LV_OBJ_FLAG_PRESS_LOCK);
-}
-
-void update_qr_user(String macAddress, String idDoor, String token) {
-  if (my_mac_address != macAddress)
-    return;
-  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
-  if (myIdDoor != idDoor)
-    return;
-  my_token = idDoor + "::" + token;
-  const char *data = my_token.c_str();
-  lv_qrcode_update(qrUser, data, strlen(data));
-}
-
-void update_qr_manager() {
-  String current_mac = WiFi.macAddress();
-  if (my_mac_address != current_mac) {
-    my_mac_address = current_mac;
-    lv_qrcode_update(qrManager, my_mac_address.c_str(), my_mac_address.length());
-    is_update_mac = false;
-  }
-
-  if (is_update_mac)
-    return;
-  if (!client.connected())
-    return;
-
-  String door_id = preferences.getString(PREF_ID_DOOR, "");
-  if (door_id.isEmpty())
-    return;
-  String sendMsg = String(FROM_ESP) + "::" + String(UPDATE_MAC) + "::" + my_mac_address + "::" + door_id;
-  send_message_mqtt(sendMsg);
-  is_update_mac = true;
-}
-
-void access_door(String macAddress, String idDoor) {
-  if (my_mac_address != macAddress)
-    return;
-  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
-  if (myIdDoor != idDoor)
-    return;
-  open_door();
-}
-
-void open_door() {
-  ledcWrite(LED_GREEN_PIN, 0);
-  vTaskDelay(10000 / portTICK_PERIOD_MS);
-  ledcWrite(LED_GREEN_PIN, 255);
-}
-
-void check_token() {
-  if (!client.connected())
-    return;
-  if (is_update_qr_user)
-    return;
-  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
-  if (myIdDoor.isEmpty())
-    return;
-  String requestQrUserMsg = String(FROM_ESP) + "::" + String(CHECK_TOKEN) + "::" + my_mac_address + "::" + myIdDoor;
-  send_message_mqtt(requestQrUserMsg);
-  is_update_qr_user = true;
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
-}
-
-void get_response_check_token(String macAddress, String idDoor, String response) {
-  if (my_mac_address != macAddress)
-    return;
-  String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
-  if (myIdDoor != idDoor)
-    return;
-  if (response == "TokenInvalid") {
-    is_update_qr_user = false;
-  } else {
-    update_qr_user(macAddress, idDoor, response);
-  }
-}
-
 void setup() {
   Serial.begin(115200);
 
   preferences.begin("my-esp", false);
-
   SerialBT.begin("ESP32_LVGL");
-  delay(10);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(WHISTLE_PIN, OUTPUT);
+  pinMode(SPEAKER_PIN, OUTPUT);
 
   pinMode(LED_GREEN_PIN, OUTPUT);
   pinMode(LED_BLUE_PIN, OUTPUT);
+
   digitalWrite(LED_GREEN_PIN, HIGH);
   digitalWrite(LED_BLUE_PIN, HIGH);
 
   setup_rfid();
-  delay(10);
-
-  setup_wifi();
-  delay(10);
-
-  setup_mqtt();
-  delay(10);
-
   setup_lvgl();
-  delay(10);
+  setup_wifi();
+  setup_mqtt();
+
+  xTaskCreate(mqtt_task, "MQTT Task", 2048, NULL, 1, NULL);
+  xTaskCreate(whistle_task, "WHISTLE Task", 1024, NULL, 1, NULL);
 }
 
+//----------------------------------
 void main_loop() {
+  scan_rfid();
+
   if (SerialBT.isReady()) {
     receive_bluetooth_data();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    handle_wifi_reconnect();
   }
-
-  if (!client.connected()) {
-    reconnect_mqtt();
-  }
-  client.loop();
 
   update_qr_manager();
-  if (my_token.isEmpty())
-    check_token();
+  check_token();
 }
 
 void loop() {
   lv_task_handler();
   lv_tick_inc(5);
-  delay(10);
+  delay(5);
   main_loop();
 }

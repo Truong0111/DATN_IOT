@@ -241,6 +241,7 @@ void receive_bluetooth_data() {
 }
 
 void handle_wifi_config(const String &ssid, const String &password) {
+  WiFi.disconnect();
   if (ssid.isEmpty()) {
     Serial.println("Error: Invalid WIFI format.");
     return;
@@ -308,6 +309,7 @@ void reconnect_mqtt() {
       is_update_qr_user = false;
     } else {
       Serial.printf("Failed, rc=%d. Trying again in 5 seconds.\n", client.state());
+      delay(5000);
     }
   }
 }
@@ -478,12 +480,12 @@ void check_token() {
   String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
   if (myIdDoor.isEmpty()) {
     send_message_mqtt(String(FROM_ESP) + "::" + String(REQUEST_ID_DOOR) + "::" + my_mac_address);
-    delay(2000 / portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     return;
   }
 
   send_message_mqtt(String(FROM_ESP) + "::" + String(CHECK_TOKEN) + "::" + my_mac_address + "::" + myIdDoor);
-  delay(2000 / portTICK_PERIOD_MS);
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
 }
 
 void get_response_check_token(String macAddress, String idDoor, String response) {
@@ -502,20 +504,6 @@ void get_response_check_token(String macAddress, String idDoor, String response)
 //----------------------------------
 
 //---------- Task ----------
-
-void mqtt_task(void *pvParameters) {
-  while (true) {
-    if (WiFi.status() != WL_CONNECTED) {
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      continue;
-    }
-    if (!client.connected()) {
-      reconnect_mqtt();
-    }
-    client.loop();
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-}
 
 void whistle_task(void *pvParameters) {
   while (true) {
@@ -561,7 +549,6 @@ void setup_wifi() {
   String saveSSID = preferences.getString(PREF_SSID, "");
   String saveSSIDPassword = preferences.getString(PREF_SSID_PWD, "");
 
-  // Add list of WiFi networks
   if (!saveSSID.isEmpty() && !saveSSIDPassword.isEmpty()) {
     WiFi.begin(saveSSID.c_str(), saveSSIDPassword.c_str());
   } else {
@@ -604,7 +591,11 @@ void setup() {
   Serial.begin(115200);
 
   preferences.begin("my-esp", false);
-  SerialBT.begin("ESP32_LVGL");
+
+  if (!SerialBT.begin("ESP32_LVGL")) {
+    Serial.println("Can't start Bluetooth");
+    return;
+  }
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(WHISTLE_PIN, OUTPUT);
@@ -621,21 +612,25 @@ void setup() {
   setup_wifi();
   setup_mqtt();
 
-  xTaskCreate(mqtt_task, "MQTT Task", 2048, NULL, 1, NULL);
-  xTaskCreate(whistle_task, "WHISTLE Task", 1024, NULL, 1, NULL);
+  // xTaskCreate(mqtt_task, "MQTTTask", 2048, NULL, 1, NULL);
+  xTaskCreate(whistle_task, "WHISTLETask", 1024, NULL, 1, NULL);
 }
 
 //----------------------------------
 void main_loop() {
   scan_rfid();
 
-  if (SerialBT.isReady()) {
-    receive_bluetooth_data();
-  }
+  receive_bluetooth_data();
 
   if (WiFi.status() != WL_CONNECTED) {
     handle_wifi_reconnect();
+    return;
   }
+
+  if (!client.connected()) {
+    reconnect_mqtt();
+  }
+  client.loop();
 
   update_qr_manager();
   check_token();

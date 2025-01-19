@@ -305,6 +305,7 @@ void reconnect_mqtt() {
       client.setKeepAlive(30);
       client.subscribe(MQTT_TOPIC);
       Serial.println("Subscribed to: " + String(MQTT_TOPIC));
+      is_update_qr_user = false;
     } else {
       Serial.printf("Failed, rc=%d. Trying again in 5 seconds.\n", client.state());
     }

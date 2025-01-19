@@ -478,13 +478,12 @@ void check_token() {
   String myIdDoor = preferences.getString(PREF_ID_DOOR, "");
   if (myIdDoor.isEmpty()) {
     send_message_mqtt(String(FROM_ESP) + "::" + String(REQUEST_ID_DOOR) + "::" + my_mac_address);
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    delay(2000 / portTICK_PERIOD_MS);
     return;
   }
 
   send_message_mqtt(String(FROM_ESP) + "::" + String(CHECK_TOKEN) + "::" + my_mac_address + "::" + myIdDoor);
-
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
+  delay(2000 / portTICK_PERIOD_MS);
 }
 
 void get_response_check_token(String macAddress, String idDoor, String response) {
